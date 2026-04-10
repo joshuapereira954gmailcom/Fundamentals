@@ -1,364 +1,659 @@
-"""
-╔══════════════════════════════════════════════════════╗
-║     SMC FOREX NEWS ALERT BOT v1.0                   ║
-║     Monitors: CPI | NFP | Fed | ECB | BoE | Geo     ║
-║     Sends: Formatted Telegram alerts                 ║
-║     Pairs: EURUSD | GBPUSD                          ║
-╚══════════════════════════════════════════════════════╝
-"""
+“””
+╔══════════════════════════════════════════════════════════════════╗
+║     SMC AI TRADING INTELLIGENCE BOT v3.0                       ║
+║     Live Signals | AI Analysis | Self-Learning | Grey Levels    ║
+║     Powered by Claude AI + Smart Money Concepts                 ║
+╚══════════════════════════════════════════════════════════════════╝
 
-import os
-import time
-import json
-import logging
-import requests
-import feedparser
+HOW IT WORKS:
+
+1. Scans live news every 5 minutes
+1. Fetches real price levels (PDH/PDL/PWH/PWL/EQ)
+1. Claude AI analyses everything together
+1. Sends ONE clean signal with entry/SL/TP
+1. Tracks every signal result and learns over time
+1. Win rate improves automatically the more you use it
+
+COMMANDS IN TELEGRAM:
+/signal  - Force immediate AI signal now
+/stats   - Full performance report
+/win5    - Mark signal #5 as WIN (trains AI)
+/loss5   - Mark signal #5 as LOSS (trains AI)
+“””
+
+import os, time, json, logging, requests, feedparser
 from datetime import datetime, timezone
+from pathlib import Path
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-# ─── CONFIG ────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
-CHECK_INTERVAL   = 300   # seconds (5 min news scan)
-CALENDAR_INTERVAL = 3600 # seconds (1 hour calendar scan)
+# ─── CONFIG ────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-log = logging.getLogger(__name__)
+TELEGRAM_TOKEN    = os.getenv(“TELEGRAM_TOKEN”,    “”)
+TELEGRAM_CHAT_ID  = os.getenv(“TELEGRAM_CHAT_ID”,  “”)
+ANTHROPIC_API_KEY = os.getenv(“ANTHROPIC_API_KEY”, “”)
+TWELVEDATA_KEY    = os.getenv(“TWELVEDATA_API_KEY”, “1fe556c8ecd3450f8bf96c25c33db366”)
 
-# ─── NEWS SOURCES (RSS FEEDS) ──────────────────────────────
-RSS_FEEDS = [
-    {"name": "ForexLive",     "url": "https://www.forexlive.com/feed/news"},
-    {"name": "FXStreet",      "url": "https://www.fxstreet.com/rss/news"},
-    {"name": "Reuters FX",    "url": "https://feeds.reuters.com/reuters/businessNews"},
-    {"name": "Investing.com", "url": "https://www.investing.com/rss/news_25.rss"},
-    {"name": "MarketWatch",   "url": "https://feeds.marketwatch.com/marketwatch/marketpulse/"},
-]
+PAIRS        = [“EUR/USD”, “GBP/USD”]
+DB_FILE      = Path(“signal_memory.json”)
+CALENDAR_URL = “https://nfs.faireconomy.media/ff_calendar_thisweek.json”
 
-# ─── HIGH IMPACT KEYWORDS ──────────────────────────────────
-HIGH_IMPACT = [
-    "CPI", "consumer price index", "inflation",
-    "NFP", "non-farm payroll", "jobs report", "unemployment",
-    "federal reserve", "fed rate", "FOMC", "powell", "rate decision",
-    "ECB", "lagarde", "european central bank", "rate cut", "rate hike",
-    "bank of england", "BOE", "bailey", "interest rate",
-    "GDP", "gross domestic product",
-    "ceasefire", "geopolitical", "war", "conflict", "sanctions",
-    "EURUSD", "EUR/USD", "GBPUSD", "GBP/USD",
-    "dollar", "euro", "pound", "sterling",
-    "ISM", "PMI", "retail sales", "trade balance",
-]
-
-# ─── SENTIMENT RULES ───────────────────────────────────────
-BULL_USD = [
-    "strong jobs", "beat expectations", "hawkish fed", "rate hike",
-    "above forecast", "stronger than expected", "hot cpi", "high inflation",
-    "powell hawkish", "fed hike", "resilient economy", "robust growth",
-]
-BEAR_USD = [
-    "weak jobs", "miss expectations", "dovish fed", "rate cut",
-    "below forecast", "weaker than expected", "cool inflation", "low inflation",
-    "powell dovish", "fed cut", "recession", "slowdown", "ceasefire",
-    "de-escalation", "risk-on", "safe haven fades",
-]
-BULL_EUR = [
-    "ecb hawkish", "euro strong", "eurozone growth", "ecb rate hike",
-    "germany strong", "eurozone beat", "lagarde hawkish",
-]
-BEAR_EUR = [
-    "ecb dovish", "euro weak", "eurozone recession", "ecb cut",
-    "germany weak", "eurozone miss", "lagarde dovish",
-]
-
-# ─── SEEN HEADLINES CACHE ──────────────────────────────────
+logging.basicConfig(level=logging.INFO, format=”%(asctime)s [%(levelname)s] %(message)s”)
+log = logging.getLogger(**name**)
 seen_headlines: set = set()
+last_update_id = 0
 
-# ─── ECONOMIC CALENDAR ─────────────────────────────────────
-# Using free Forex Factory calendar API (community endpoint)
-CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+# ══════════════════════════════════════════════════════════════
 
-HIGH_IMPACT_EVENTS = [
-    "Non-Farm Employment Change", "Unemployment Rate", "CPI m/m", "CPI y/y",
-    "Core CPI m/m", "GDP q/q", "GDP m/m", "Retail Sales m/m",
-    "FOMC Statement", "Fed Funds Rate", "FOMC Press Conference",
-    "ECB Main Refinancing Rate", "ECB Monetary Policy Statement",
-    "BOE Official Bank Rate", "BOE Monetary Policy Summary",
-    "ISM Manufacturing PMI", "ISM Services PMI",
-    "PPI m/m", "Core PCE Price Index m/m",
-    "Flash Manufacturing PMI", "Flash Services PMI",
-]
+# SELF-LEARNING MEMORY
 
-# ─── TELEGRAM SENDER ───────────────────────────────────────
-def send_telegram(message: str) -> bool:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            log.info("✅ Alert sent to Telegram")
-            return True
-        else:
-            log.error(f"❌ Telegram error: {r.text}")
-            return False
-    except Exception as e:
-        log.error(f"❌ Telegram exception: {e}")
-        return False
+# ══════════════════════════════════════════════════════════════
 
-# ─── SENTIMENT ENGINE ──────────────────────────────────────
-def classify_sentiment(text: str) -> dict:
-    text_lower = text.lower()
+def load_memory() -> dict:
+if DB_FILE.exists():
+try:
+return json.loads(DB_FILE.read_text())
+except:
+pass
+return {
+“signals”: [], “total_signals”: 0,
+“wins”: 0, “losses”: 0, “win_rate”: 0.0,
+“best_setup”: “”, “worst_setup”: “”,
+“setup_stats”: {}, “session_stats”: {}, “pair_stats”: {},
+“last_updated”: “”,
+}
 
-    usd_bull = sum(1 for k in BULL_USD if k in text_lower)
-    usd_bear = sum(1 for k in BEAR_USD if k in text_lower)
-    eur_bull = sum(1 for k in BULL_EUR if k in text_lower)
-    eur_bear = sum(1 for k in BEAR_EUR if k in text_lower)
+def save_memory(mem: dict):
+mem[“last_updated”] = datetime.now(timezone.utc).isoformat()
+DB_FILE.write_text(json.dumps(mem, indent=2))
 
-    # USD Sentiment
-    if usd_bull > usd_bear + 1:
-        usd_sent = "🔴 BEARISH EUR/GBP (USD Strong)"
-        eurusd_bias = "SELL"
-        gbpusd_bias = "SELL"
-    elif usd_bear > usd_bull + 1:
-        usd_sent = "🟢 BULLISH EUR/GBP (USD Weak)"
-        eurusd_bias = "BUY"
-        gbpusd_bias = "BUY"
-    else:
-        usd_sent = "⚪ NEUTRAL"
-        eurusd_bias = "WAIT"
-        gbpusd_bias = "WAIT"
+def record_signal(mem: dict, sig: dict) -> dict:
+mem[“signals”].append({
+“id”: mem[“total_signals”] + 1,
+“ts”: datetime.now(timezone.utc).isoformat(),
+“pair”: sig.get(“pair”), “bias”: sig.get(“bias”),
+“entry”: sig.get(“entry”), “sl”: sig.get(“sl”),
+“tp1”: sig.get(“tp1”), “tp2”: sig.get(“tp2”),
+“confidence”: sig.get(“confidence”),
+“setup”: sig.get(“setup”), “session”: sig.get(“session”),
+“outcome”: “PENDING”,
+})
+mem[“total_signals”] += 1
+save_memory(mem)
+return mem
 
-    # EUR specific
-    if eur_bull > eur_bear:
-        eurusd_bias = "BUY"
-    elif eur_bear > eur_bull:
-        eurusd_bias = "SELL"
+def record_outcome(mem: dict, sig_id: int, outcome: str) -> dict:
+for s in mem[“signals”]:
+if s[“id”] == sig_id and s[“outcome”] == “PENDING”:
+s[“outcome”] = outcome
+mem[“wins” if outcome == “WIN” else “losses”] += 1
+tot = mem[“wins”] + mem[“losses”]
+mem[“win_rate”] = round(mem[“wins”] / tot * 100, 1) if tot else 0
 
-    # Confidence score
-    total_signals = usd_bull + usd_bear + eur_bull + eur_bear
-    if total_signals >= 4:
-        confidence = "HIGH 🔥"
-    elif total_signals >= 2:
-        confidence = "MEDIUM ⚡"
-    else:
-        confidence = "LOW 💡"
+```
+        def update_stat(d, key, outcome):
+            if key not in d:
+                d[key] = {"wins": 0, "losses": 0, "win_rate": 0}
+            d[key]["wins" if outcome == "WIN" else "losses"] += 1
+            t = d[key]["wins"] + d[key]["losses"]
+            d[key]["win_rate"] = round(d[key]["wins"] / t * 100, 1) if t else 0
 
-    return {
-        "usd_sentiment": usd_sent,
-        "eurusd_bias": eurusd_bias,
-        "gbpusd_bias": gbpusd_bias,
-        "confidence": confidence,
-        "bull_signals": usd_bull + eur_bull,
-        "bear_signals": usd_bear + eur_bear,
-    }
+        update_stat(mem["setup_stats"],   s.get("setup", "?"),   outcome)
+        update_stat(mem["session_stats"], s.get("session", "?"), outcome)
+        update_stat(mem["pair_stats"],    s.get("pair", "?"),    outcome)
 
-def is_high_impact(title: str, summary: str) -> bool:
-    combined = (title + " " + summary).lower()
-    return any(kw.lower() in combined for kw in HIGH_IMPACT)
+        if mem["setup_stats"]:
+            b = max(mem["setup_stats"].items(), key=lambda x: x[1]["win_rate"])
+            w = min(mem["setup_stats"].items(), key=lambda x: x[1]["win_rate"])
+            mem["best_setup"]  = f"{b[0]} ({b[1]['win_rate']}%)"
+            mem["worst_setup"] = f"{w[0]} ({w[1]['win_rate']}%)"
+        break
 
-# ─── NEWS SCANNER ──────────────────────────────────────────
-def scan_news():
-    log.info("🔍 Scanning news feeds...")
-    now = datetime.now(timezone.utc)
-    alerts_sent = 0
+save_memory(mem)
+return mem
+```
 
-    for feed_info in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(feed_info["url"])
-            for entry in feed.entries[:10]:
-                title   = entry.get("title", "")
-                summary = entry.get("summary", "")
-                link    = entry.get("link", "")
+def learning_context(mem: dict) -> str:
+if mem[“total_signals”] == 0:
+return “No history yet. First signal — use neutral confidence baseline.”
+return f”””
+LEARNING DATA ({mem[‘total_signals’]} signals tracked):
+Win Rate: {mem[‘win_rate’]}% | Wins: {mem[‘wins’]} | Losses: {mem[‘losses’]}
+Best Setup: {mem.get(‘best_setup’,‘N/A’)}
+Worst Setup: {mem.get(‘worst_setup’,‘N/A’)}
+Setup Stats: {json.dumps(mem[‘setup_stats’])}
+Session Stats: {json.dumps(mem[‘session_stats’])}
+Pair Stats: {json.dumps(mem[‘pair_stats’])}
+INSTRUCTION: Adjust confidence UP for historically strong setups/sessions.
+Adjust confidence DOWN for historically weak ones. Learn from the data.
+“””.strip()
 
-                if title in seen_headlines:
-                    continue
+# ══════════════════════════════════════════════════════════════
 
-                if is_high_impact(title, summary):
-                    seen_headlines.add(title)
-                    sentiment = classify_sentiment(title + " " + summary)
+# PRICE LEVELS (Grey Level Technology)
 
-                    msg = format_news_alert(
-                        source=feed_info["name"],
-                        title=title,
-                        summary=summary[:280] + "..." if len(summary) > 280 else summary,
-                        link=link,
-                        sentiment=sentiment,
-                        now=now,
-                    )
-                    send_telegram(msg)
-                    alerts_sent += 1
-                    time.sleep(1)  # rate limit
+# ══════════════════════════════════════════════════════════════
 
-        except Exception as e:
-            log.warning(f"⚠️ Feed error [{feed_info['name']}]: {e}")
+def get_levels(pair: str) -> dict:
+try:
+if not TWELVEDATA_KEY:
+raise ValueError(“No API key”)
+url = (f”https://api.twelvedata.com/time_series”
+f”?symbol={pair}&interval=1day&outputsize=6&apikey={TWELVEDATA_KEY}”)
+d = requests.get(url, timeout=10).json()
+if “values” not in d:
+raise ValueError(“Bad response”)
+v       = d[“values”]
+cur     = float(v[0][“close”])
+pdh     = float(v[1][“high”])
+pdl     = float(v[1][“low”])
+pdo     = float(v[1][“open”])
+pwh     = max(float(x[“high”]) for x in v)
+pwl     = min(float(x[“low”])  for x in v)
+eq      = round((pdh + pdl) / 2, 5)
+pip     = lambda a, b: round(abs(a-b)*10000, 1)
+return {
+“pair”: pair, “current”: round(cur,5),
+“pdh”: round(pdh,5), “pdl”: round(pdl,5),
+“pdo”: round(pdo,5), “pwh”: round(pwh,5),
+“pwl”: round(pwl,5), “eq”: eq,
+“bias”: “BULLISH” if cur > pdo else “BEARISH”,
+“pips_pdh”: pip(cur,pdh), “pips_pdl”: pip(cur,pdl),
+“pips_pwh”: pip(cur,pwh), “pips_pwl”: pip(cur,pwl),
+“pips_eq”:  pip(cur,eq),
+“above_pdh”: cur > pdh, “below_pdl”: cur < pdl,
+}
+except Exception as e:
+log.warning(f”Levels error {pair}: {e}”)
+return {“pair”: pair, “error”: str(e), “current”: 0, “bias”: “NEUTRAL”}
 
-    log.info(f"✅ News scan complete — {alerts_sent} alerts sent")
+# ══════════════════════════════════════════════════════════════
 
-# ─── CALENDAR SCANNER ──────────────────────────────────────
-def scan_calendar():
-    log.info("📅 Scanning economic calendar...")
-    try:
-        r = requests.get(CALENDAR_URL, timeout=15)
-        events = r.json()
-        now = datetime.now(timezone.utc)
+# SESSION
 
-        upcoming = []
-        for ev in events:
-            if ev.get("impact", "").lower() != "high":
-                continue
-            ev_title    = ev.get("title", "")
-            ev_country  = ev.get("country", "")
-            ev_time_str = ev.get("date", "")
-            ev_forecast = ev.get("forecast", "N/A")
-            ev_previous = ev.get("previous", "N/A")
+# ══════════════════════════════════════════════════════════════
 
-            if ev_country not in ["USD", "EUR", "GBP"]:
-                continue
+def get_session() -> str:
+h = datetime.now(timezone.utc).hour
+if 7  <= h < 10: return “LONDON”
+if 12 <= h < 15: return “NEW YORK”
+if 0  <= h < 3:  return “ASIA”
+return “OFF-SESSION”
 
+def session_emoji(s: str) -> str:
+return {“LONDON”:“🇬🇧”,“NEW YORK”:“🇺🇸”,“ASIA”:“🌏”}.get(s,“🌐”)
+
+# ══════════════════════════════════════════════════════════════
+
+# NEWS
+
+# ══════════════════════════════════════════════════════════════
+
+HI_KW = [“CPI”,“inflation”,“NFP”,“non-farm”,“unemployment”,“federal reserve”,
+“FOMC”,“powell”,“rate”,“ECB”,“lagarde”,“BOE”,“bailey”,“GDP”,
+“ceasefire”,“geopolitical”,“EURUSD”,“GBPUSD”,“dollar”,“euro”,“pound”,“PMI”]
+
+def get_news(n=5) -> list:
+out = []
+for feed in [“https://www.forexlive.com/feed/news”,
+“https://www.fxstreet.com/rss/news”]:
+try:
+for e in feedparser.parse(feed).entries[:10]:
+t = e.get(“title”,””)
+if any(k.lower() in t.lower() for k in HI_KW):
+out.append(t)
+if len(out) >= n: return out
+except: pass
+return out
+
+def sentiment(text: str) -> dict:
+t = text.lower()
+BULL_USD = [“strong jobs”,“beat expectations”,“hawkish”,“rate hike”,“above forecast”,“stronger than expected”,“hot cpi”,“resilient”]
+BEAR_USD = [“weak jobs”,“miss”,“dovish”,“rate cut”,“below forecast”,“weaker than expected”,“cool inflation”,“recession”,“ceasefire”,“de-escalation”]
+BULL_EUR = [“ecb hawkish”,“euro strong”,“eurozone growth”,“lagarde hawkish”]
+BEAR_EUR = [“ecb dovish”,“euro weak”,“eurozone recession”,“lagarde dovish”]
+ub=sum(1 for k in BULL_USD if k in t); ud=sum(1 for k in BEAR_USD if k in t)
+eb=sum(1 for k in BULL_EUR if k in t); ed=sum(1 for k in BEAR_EUR if k in t)
+eu = “BUY” if (ud>ub+1 or eb>ed) else “SELL” if (ub>ud+1 or ed>eb) else “WAIT”
+gb = “BUY” if ud>ub+1 else “SELL” if ub>ud+1 else “WAIT”
+c  = sum([ub,ud,eb,ed])
+conf = “HIGH 🔥” if c>=4 else “MEDIUM ⚡” if c>=2 else “LOW 💡”
+return {“eurusd”: eu, “gbpusd”: gb, “conf”: conf}
+
+# ══════════════════════════════════════════════════════════════
+
+# CALENDAR
+
+# ══════════════════════════════════════════════════════════════
+
+def get_events() -> list:
+try:
+events = requests.get(CALENDAR_URL, timeout=15).json()
+now    = datetime.now(timezone.utc)
+out    = []
+for ev in events:
+if ev.get(“impact”,””).lower() != “high”: continue
+if ev.get(“country”,””) not in [“USD”,“EUR”,“GBP”]: continue
+try:
+dt   = datetime.fromisoformat(ev[“date”].replace(“Z”,”+00:00”))
+diff = (dt - now).total_seconds() / 60
+if 0 < diff <= 120:
+out.append({“title”: ev.get(“title”,””), “country”: ev.get(“country”,””),
+“minutes”: int(diff), “forecast”: ev.get(“forecast”,“N/A”),
+“previous”: ev.get(“previous”,“N/A”)})
+except: continue
+return out
+except: return []
+
+# ══════════════════════════════════════════════════════════════
+
+# CLAUDE AI ENGINE
+
+# ══════════════════════════════════════════════════════════════
+
+def ask_claude(prompt: str) -> str:
+try:
+r = requests.post(
+“https://api.anthropic.com/v1/messages”,
+headers={“x-api-key”: ANTHROPIC_API_KEY,
+“anthropic-version”: “2023-06-01”,
+“content-type”: “application/json”},
+json={“model”: “claude-sonnet-4-20250514”, “max_tokens”: 1000,
+“messages”: [{“role”: “user”, “content”: prompt}]},
+timeout=30,
+)
+return r.json()[“content”][0][“text”]
+except Exception as e:
+log.error(f”Claude error: {e}”)
+return “”
+
+def generate_signal(pair: str, lv: dict, news: list, events: list,
+session: str, mem: dict) -> dict:
+
+```
+lc = learning_context(mem)
+nw = "\n".join(news) if news else "No major news."
+ev = "\n".join([f"- {e['country']} {e['title']} in {e['minutes']}min "
+                f"(Fcst:{e['forecast']} Prev:{e['previous']})"
+                for e in events]) if events else "No events next 2hrs."
+
+lvl = f"""
+```
+
+Current Price : {lv.get(‘current’,‘N/A’)}
+PDH (BSL)     : {lv.get(‘pdh’,‘N/A’)}  [{lv.get(‘pips_pdh’,’?’)} pips away]
+PDL (SSL)     : {lv.get(‘pdl’,‘N/A’)}  [{lv.get(‘pips_pdl’,’?’)} pips away]
+PWH           : {lv.get(‘pwh’,‘N/A’)}  [{lv.get(‘pips_pwh’,’?’)} pips away]
+PWL           : {lv.get(‘pwl’,‘N/A’)}  [{lv.get(‘pips_pwl’,’?’)} pips away]
+Equilibrium   : {lv.get(‘eq’,‘N/A’)}   [{lv.get(‘pips_eq’,’?’)} pips away]
+HTF Bias      : {lv.get(‘bias’,‘N/A’)}
+Above PDH     : {lv.get(‘above_pdh’,False)}
+Below PDL     : {lv.get(‘below_pdl’,False)}
+“””.strip()
+
+```
+prompt = f"""
+```
+
+You are an elite institutional forex trading AI using Smart Money Concepts (SMC).
+Analyse this data for {pair} and generate ONE precise trade signal.
+
+GREY LEVEL TECHNOLOGY (Key Price Levels):
+{lvl}
+
+SESSION: {session} {session_emoji(session)}
+TIME: {datetime.now(timezone.utc).strftime(’%H:%M UTC’)}
+
+LIVE NEWS:
+{nw}
+
+UPCOMING EVENTS:
+{ev}
+
+SELF-LEARNING DATA:
+{lc}
+
+Respond ONLY in this exact JSON format. No other text:
+{{
+“bias”: “BUY” or “SELL” or “NO TRADE”,
+“setup”: “PDH Sweep+BOS” or “PDL Sweep+BOS” or “EQ Retest” or “PWH Break” or “PWL Break” or “FVG Entry” or “Momentum” or “NO TRADE”,
+“entry_zone”: “price or zone”,
+“stop_loss”: “price”,
+“tp1”: “price”,
+“tp2”: “price”,
+“rr”: “e.g. 1:2.5”,
+“confidence”: 0-100,
+“key_level”: “most important level right now”,
+“news_alignment”: “ALIGNED” or “CONFLICTED” or “NEUTRAL”,
+“session_quality”: “HIGH” or “MEDIUM” or “LOW”,
+“avoid_reason”: “if NO TRADE explain why”,
+“reasoning”: “2-3 sentences max”,
+“smart_money_note”: “one key SMC observation”,
+“risk_warning”: “specific risk right now”
+}}
+
+Rules:
+
+- News conflicts with technicals = reduce confidence 20% or NO TRADE
+- High impact event in <30 min = NO TRADE
+- No clear setup = NO TRADE
+- Confidence must reflect learning data
+- Only BUY/SELL if confidence above 60
+- Be decisive. Institutions dont hesitate.
+  “””.strip()
+  
+  resp = ask_claude(prompt)
+  try:
+  clean = resp.strip()
+  if “`" in clean: clean = clean.split("`”)[1]
+  if clean.startswith(“json”): clean = clean[4:]
+  return json.loads(clean)
+  except Exception as e:
+  log.error(f”Parse error: {e} | {resp[:100]}”)
+  return {“bias”:“NO TRADE”,“avoid_reason”:“AI parse error”,“confidence”:0}
+
+# ══════════════════════════════════════════════════════════════
+
+# TELEGRAM
+
+# ══════════════════════════════════════════════════════════════
+
+def tg(msg: str) -> bool:
+try:
+r = requests.post(
+f”https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage”,
+json={“chat_id”: TELEGRAM_CHAT_ID, “text”: msg,
+“parse_mode”: “HTML”, “disable_web_page_preview”: True},
+timeout=10)
+return r.status_code == 200
+except Exception as e:
+log.error(f”TG error: {e}”); return False
+
+# ══════════════════════════════════════════════════════════════
+
+# MESSAGE FORMATTERS
+
+# ══════════════════════════════════════════════════════════════
+
+def fmt_signal(pair, sig, lv, session, mem, sid) -> str:
+bias = sig.get(“bias”,“NO TRADE”)
+conf = sig.get(“confidence”,0)
+be   = {“BUY”:“🟢”,“SELL”:“🔴”,“NO TRADE”:“⚪”}.get(bias,“⚪”)
+ce   = “🔥” if conf>=75 else “⚡” if conf>=55 else “💡”
+ae   = {“ALIGNED”:“✅”,“CONFLICTED”:“❌”,“NEUTRAL”:“➖”}.get(sig.get(“news_alignment”,“NEUTRAL”),“➖”)
+se   = {“HIGH”:“🔥”,“MEDIUM”:“⚡”,“LOW”:“💡”}.get(sig.get(“session_quality”,“LOW”),“💡”)
+pd   = pair.replace(”/”,””)
+
+```
+if bias == "NO TRADE":
+    return f"""
+```
+
+⚪ <b>NO TRADE — {pd}</b>
+━━━━━━━━━━━━━━━━━━━━━━
+{session_emoji(session)} {session} | {datetime.now(timezone.utc).strftime(’%H:%M UTC’)}
+📊 Price: <code>{lv.get(‘current’,‘N/A’)}</code>
+
+🚫 <b>Reason:</b> {sig.get(‘avoid_reason’,‘N/A’)}
+🔑 <b>Watch Level:</b> {sig.get(‘key_level’,‘N/A’)}
+⚠️ <b>Risk:</b> {sig.get(‘risk_warning’,‘N/A’)}
+💭 {sig.get(‘reasoning’,’’)}
+
+📈 Bot Stats: <b>{mem[‘win_rate’]}%</b> win rate | {mem[‘total_signals’]} signals
+━━━━━━━━━━━━━━━━━━━━━━
+<i>SMC AI Bot v3.0 | Not financial advice</i>”””.strip()
+
+```
+return f"""
+```
+
+{be} <b>SIGNAL #{sid} — {pd} {bias}</b>
+━━━━━━━━━━━━━━━━━━━━━━
+{session_emoji(session)} <b>{session}</b> {se} | {datetime.now(timezone.utc).strftime(’%H:%M UTC’)}
+
+💰 <b>ENTRY:</b>  <code>{sig.get(‘entry_zone’,‘N/A’)}</code>
+🛑 <b>SL:</b>     <code>{sig.get(‘stop_loss’,‘N/A’)}</code>
+🎯 <b>TP1:</b>    <code>{sig.get(‘tp1’,‘N/A’)}</code>
+🏆 <b>TP2:</b>    <code>{sig.get(‘tp2’,‘N/A’)}</code>
+⚖️ <b>R:R:</b>    {sig.get(‘rr’,‘N/A’)}
+
+━━━━━━━━━━━━━━━━━━━━━━
+📊 <b>GREY LEVELS</b>
+💵 Price:  <code>{lv.get(‘current’,‘N/A’)}</code>
+🟢 PDH:    <code>{lv.get(‘pdh’,‘N/A’)}</code>  ({lv.get(‘pips_pdh’,’?’)} pips)
+🔴 PDL:    <code>{lv.get(‘pdl’,‘N/A’)}</code>  ({lv.get(‘pips_pdl’,’?’)} pips)
+⚪ EQ:     <code>{lv.get(‘eq’,‘N/A’)}</code>
+🔑 Key:    {sig.get(‘key_level’,‘N/A’)}
+
+━━━━━━━━━━━━━━━━━━━━━━
+🧠 <b>AI ANALYSIS</b>
+📐 Setup:  {sig.get(‘setup’,‘N/A’)}
+📰 News:   {ae} {sig.get(‘news_alignment’,‘N/A’)}
+{ce} <b>Confidence: {conf}%</b>
+
+💭 {sig.get(‘reasoning’,‘N/A’)}
+🏦 <i>{sig.get(‘smart_money_note’,’’)}</i>
+⚠️ {sig.get(‘risk_warning’,‘N/A’)}
+
+━━━━━━━━━━━━━━━━━━━━━━
+📈 <b>BOT STATS</b>
+Win Rate: <b>{mem[‘win_rate’]}%</b> | Signals: {mem[‘total_signals’]}
+Best: {mem.get(‘best_setup’,‘Building…’)}
+
+<i>Reply /win{sid} or /loss{sid} to train the AI 🧠</i>
+━━━━━━━━━━━━━━━━━━━━━━
+<i>SMC AI Bot v3.0 | Not financial advice</i>”””.strip()
+
+def fmt_stats(mem) -> str:
+def lines(d):
+return “\n”.join([f”  {k}: {v[‘win_rate’]}% ({v[‘wins’]}W/{v[‘losses’]}L)”
+for k,v in d.items()]) or “  No data yet”
+return f”””
+📊 <b>AI BOT PERFORMANCE</b>
+━━━━━━━━━━━━━━━━━━━━━━
+🏆 Win Rate: <b>{mem[‘win_rate’]}%</b>
+📈 Signals: {mem[‘total_signals’]} | ✅ {mem[‘wins’]}W / ❌ {mem[‘losses’]}L
+
+<b>By Setup:</b>
+{lines(mem[‘setup_stats’])}
+
+<b>By Session:</b>
+{lines(mem[‘session_stats’])}
+
+<b>By Pair:</b>
+{lines(mem[‘pair_stats’])}
+
+🥇 Best:  {mem.get(‘best_setup’,‘Building…’)}
+⚠️ Worst: {mem.get(‘worst_setup’,‘Building…’)}
+━━━━━━━━━━━━━━━━━━━━━━
+<i>Bot learns from every /win and /loss command</i>”””.strip()
+
+# ══════════════════════════════════════════════════════════════
+
+# SCHEDULED TASKS
+
+# ══════════════════════════════════════════════════════════════
+
+def task_signals():
+log.info(“🤖 AI Signal scan…”)
+mem     = load_memory()
+session = get_session()
+news    = get_news(5)
+events  = get_events()
+
+```
+for pair in PAIRS:
+    lv = get_levels(pair)
+    if lv.get("error"):
+        log.warning(f"No levels for {pair}")
+        continue
+    sig = generate_signal(pair, lv, news, events, session, mem)
+    sid = mem["total_signals"] + 1
+    msg = fmt_signal(pair, sig, lv, session, mem, sid)
+    if tg(msg) and sig.get("bias") in ("BUY","SELL"):
+        mem = record_signal(mem, {
+            "pair": pair, "bias": sig.get("bias"),
+            "entry": sig.get("entry_zone"), "sl": sig.get("stop_loss"),
+            "tp1": sig.get("tp1"), "tp2": sig.get("tp2"),
+            "confidence": sig.get("confidence"),
+            "setup": sig.get("setup"), "session": session,
+        })
+    time.sleep(3)
+```
+
+def task_news():
+log.info(“📰 News scan…”)
+for feed_url in [“https://www.forexlive.com/feed/news”,
+“https://www.fxstreet.com/rss/news”]:
+try:
+for e in feedparser.parse(feed_url).entries[:8]:
+t = e.get(“title”,””); s = e.get(“summary”,””); l = e.get(“link”,””)
+if t in seen_headlines: continue
+if any(k.lower() in t.lower() for k in HI_KW):
+seen_headlines.add(t)
+sent = sentiment(t+” “+s)
+f    = {“BUY”:“🟢”,“SELL”:“🔴”,“WAIT”:“⚪”}
+msg  = f”””
+⚡ <b>NEWS ALERT</b>
+━━━━━━━━━━━━━━━━━━━━━━
+📌 <b>{t}</b>
+📝 {s[:180]}…
+{f.get(sent[‘eurusd’],‘⚪’)} EURUSD: {sent[‘eurusd’]}
+{f.get(sent[‘gbpusd’],‘⚪’)} GBPUSD: {sent[‘gbpusd’]}
+🎯 Confidence: {sent[‘conf’]}
+🔗 <a href="{l}">Read more</a>
+━━━━━━━━━━━━━━━━━━━━━━
+<i>SMC AI Bot | Not financial advice</i>”””.strip()
+tg(msg); time.sleep(1)
+except Exception as ex:
+log.warning(f”News error: {ex}”)
+
+def task_calendar():
+log.info(“📅 Calendar check…”)
+for ev in get_events():
+flag = {“USD”:“🇺🇸”,“EUR”:“🇪🇺”,“GBP”:“🇬🇧”}.get(ev[“country”],“🌐”)
+tg(f”””
+🗓 <b>EVENT — {ev[‘minutes’]} MIN WARNING</b>
+━━━━━━━━━━━━━━━━━━━━━━
+{flag} <b>{ev[‘country’]} | {ev[‘title’]}</b>
+📊 Forecast: {ev[‘forecast’]} | Previous: {ev[‘previous’]}
+⚠️ Close/widen stops. No entries within 5 min.
+Wait for post-news BOS confirmation before entry.
+━━━━━━━━━━━━━━━━━━━━━━
+<i>SMC AI Bot | Not financial advice</i>”””.strip())
+time.sleep(1)
+
+def task_killzone():
+now = datetime.now(timezone.utc)
+h, m = now.hour, now.minute
+opens = [(“LONDON”,7,0),(“NEW YORK”,12,0),(“ASIA”,0,0)]
+for name, oh, om in opens:
+if h == oh and abs(m - om) <= 1:
+lines = []
+for pair in PAIRS:
+lv = get_levels(pair)
+if not lv.get(“error”):
+lines.append(f”• {pair}: <code>{lv.get(‘current’,’?’)}</code> | “
+f”PDH:<code>{lv.get(‘pdh’,’?’)}</code> “
+f”PDL:<code>{lv.get(‘pdl’,’?’)}</code> | “
+f”{lv.get(‘bias’,’?’)}”)
+body = “\n”.join(lines) or “Fetching levels…”
+tg(f”””
+🕐 <b>{session_emoji(name)} {name} KILL ZONE — OPEN</b>
+━━━━━━━━━━━━━━━━━━━━━━
+⚡ Highest manipulation probability window.
+Smart money typically sweeps liquidity in first 30 min.
+
+<b>Current Levels:</b>
+{body}
+
+🎯 Plan: Wait for sweep → BOS → FVG retest → entry
+━━━━━━━━━━━━━━━━━━━━━━
+<i>SMC AI Bot | Not financial advice</i>”””.strip())
+break
+
+def task_commands():
+global last_update_id
+try:
+r    = requests.get(f”https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates”,
+params={“offset”: last_update_id + 1}, timeout=10)
+mem  = load_memory()
+changed = False
+for upd in r.json().get(“result”, []):
+last_update_id = upd[“update_id”]
+text = upd.get(“message”, {}).get(“text”, “”).strip().lower()
+
+```
+        if text.startswith("/win") or text.startswith("/loss"):
+            outcome = "WIN" if text.startswith("/win") else "LOSS"
             try:
-                ev_dt = datetime.fromisoformat(ev_time_str.replace("Z", "+00:00"))
-            except Exception:
-                continue
+                sid = int(text.replace("/win","").replace("/loss",""))
+                mem = record_outcome(mem, sid, outcome)
+                changed = True
+                tg(f"✅ Signal #{sid} = <b>{outcome}</b>\n"
+                   f"Win rate now: <b>{mem['win_rate']}%</b>\nAI is learning 🧠")
+            except: pass
 
-            # Alert if event is within next 60 minutes
-            diff_minutes = (ev_dt - now).total_seconds() / 60
-            if 0 < diff_minutes <= 60:
-                upcoming.append({
-                    "title":    ev_title,
-                    "country":  ev_country,
-                    "time":     ev_dt.strftime("%H:%M UTC"),
-                    "forecast": ev_forecast,
-                    "previous": ev_previous,
-                    "minutes":  int(diff_minutes),
-                })
+        elif text == "/stats":
+            tg(fmt_stats(mem))
 
-        if upcoming:
-            for ev in upcoming:
-                msg = format_calendar_alert(ev)
-                send_telegram(msg)
-                time.sleep(1)
-        else:
-            log.info("📅 No high-impact events in next 60 min")
+        elif text == "/signal":
+            tg("🤖 Generating signal now...")
+            task_signals()
 
-    except Exception as e:
-        log.error(f"❌ Calendar scan error: {e}")
+    if changed: save_memory(mem)
+except Exception as e:
+    log.warning(f"Command error: {e}")
+```
 
-# ─── MESSAGE FORMATTERS ────────────────────────────────────
-def format_news_alert(source, title, summary, link, sentiment, now) -> str:
-    flag_map = {
-        "BUY":  "🟢",
-        "SELL": "🔴",
-        "WAIT": "⚪",
-    }
-    eurusd_flag = flag_map.get(sentiment["eurusd_bias"], "⚪")
-    gbpusd_flag = flag_map.get(sentiment["gbpusd_bias"], "⚪")
+# ══════════════════════════════════════════════════════════════
 
-    return f"""
-⚡ <b>SMC NEWS ALERT</b>
-━━━━━━━━━━━━━━━━━━━━━
-📰 <b>Source:</b> {source}
-🕐 <b>Time:</b> {now.strftime("%H:%M UTC")} | {now.strftime("%d %b %Y")}
+# MAIN
 
-📌 <b>{title}</b>
+# ══════════════════════════════════════════════════════════════
 
-📝 {summary}
-
-━━━━━━━━━━━━━━━━━━━━━
-📊 <b>SENTIMENT ANALYSIS</b>
-{sentiment["usd_sentiment"]}
-
-{eurusd_flag} <b>EURUSD Bias:</b> {sentiment["eurusd_bias"]}
-{gbpusd_flag} <b>GBPUSD Bias:</b> {sentiment["gbpusd_bias"]}
-🎯 <b>Confidence:</b> {sentiment["confidence"]}
-
-🔗 <a href="{link}">Read Full Article</a>
-━━━━━━━━━━━━━━━━━━━━━
-<i>SMC Alert System | Not financial advice</i>
-""".strip()
-
-def format_calendar_alert(ev) -> str:
-    flag_map = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧"}
-    flag = flag_map.get(ev["country"], "🌐")
-
-    # Pre-classify likely market impact
-    impact_hint = ""
-    if ev["country"] == "USD":
-        impact_hint = "📉 USD move expected | Watch EURUSD + GBPUSD"
-    elif ev["country"] == "EUR":
-        impact_hint = "📉 EUR move expected | Watch EURUSD"
-    elif ev["country"] == "GBP":
-        impact_hint = "📉 GBP move expected | Watch GBPUSD"
-
-    return f"""
-🗓 <b>HIGH IMPACT EVENT — {ev['minutes']} MIN WARNING</b>
-━━━━━━━━━━━━━━━━━━━━━
-{flag} <b>{ev['country']} | {ev['title']}</b>
-🕐 <b>Release Time:</b> {ev['time']}
-
-📊 <b>Forecast:</b> {ev['forecast']}
-📈 <b>Previous:</b> {ev['previous']}
-
-⚠️ {impact_hint}
-
-🎯 <b>SMC Protocol:</b>
-• Widen stops before release
-• Wait for candle close post-news
-• Enter only on FVG retest after BOS
-• No trades 2 min before / after release
-━━━━━━━━━━━━━━━━━━━━━
-<i>SMC Alert System | Not financial advice</i>
-""".strip()
-
-def format_startup_message() -> str:
-    return f"""
-🚀 <b>SMC FOREX ALERT BOT — ONLINE</b>
-━━━━━━━━━━━━━━━━━━━━━
-✅ News Scanner: ACTIVE (every 5 min)
-✅ Calendar Monitor: ACTIVE (every 1 hr)
-✅ Pairs Monitored: EURUSD | GBPUSD
-✅ Currencies: USD | EUR | GBP
-
-📡 <b>Alert Triggers:</b>
-• High-impact news detected
-• Economic event &lt; 60 min away
-• Central bank statements
-• Geopolitical developments
-
-🕐 Started: {datetime.now(timezone.utc).strftime("%H:%M UTC | %d %b %Y")}
-━━━━━━━━━━━━━━━━━━━━━
-<i>Bot is live. Alerts incoming.</i>
-""".strip()
-
-# ─── MAIN ──────────────────────────────────────────────────
 def main():
-    log.info("🚀 SMC Forex Alert Bot starting...")
+log.info(“🚀 SMC AI Bot v3.0 starting…”)
+mem = load_memory()
+tg(f”””
+🚀 <b>SMC AI TRADING BOT v3.0 — ONLINE</b>
+━━━━━━━━━━━━━━━━━━━━━━
+✅ AI Signal Engine (every 4 hrs)
+✅ News Scanner (every 5 min)
+✅ Calendar Alerts (every 1 hr)
+✅ Kill Zone Alerts (London/NY/Asia)
+✅ Self-Learning Memory
+✅ Pairs: EURUSD | GBPUSD
 
-    # Send startup ping
-    send_telegram(format_startup_message())
+🧠 Memory: {mem[‘total_signals’]} signals | {mem[‘win_rate’]}% win rate
 
-    # Run initial scans
-    scan_news()
-    scan_calendar()
+📱 <b>Commands:</b>
+/signal — AI signal now
+/stats  — Performance report
+/win5   — Mark signal 5 WIN
+/loss5  — Mark signal 5 LOSS
 
-    # Schedule recurring scans
-    scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(scan_news,     "interval", seconds=CHECK_INTERVAL,    id="news_scan")
-    scheduler.add_job(scan_calendar, "interval", seconds=CALENDAR_INTERVAL, id="cal_scan")
+{datetime.now(timezone.utc).strftime(’%H:%M UTC | %d %b %Y’)}
+━━━━━━━━━━━━━━━━━━━━━━
+<i>Learning enabled. Gets smarter every day.</i>”””.strip())
 
-    log.info(f"⏱ News scan every {CHECK_INTERVAL//60} min | Calendar every {CALENDAR_INTERVAL//60} min")
-    log.info("✅ Bot running. Press Ctrl+C to stop.")
+```
+task_news()
+task_calendar()
+task_signals()
 
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("🛑 Bot stopped.")
+sched = BlockingScheduler(timezone="UTC")
+sched.add_job(task_signals,  "interval", hours=4,   id="signals")
+sched.add_job(task_news,     "interval", minutes=5, id="news")
+sched.add_job(task_calendar, "interval", hours=1,   id="calendar")
+sched.add_job(task_killzone, "interval", minutes=1, id="killzone")
+sched.add_job(task_commands, "interval", minutes=1, id="commands")
 
-if __name__ == "__main__":
-    main()
+log.info("✅ All systems running.")
+try:
+    sched.start()
+except (KeyboardInterrupt, SystemExit):
+    log.info("🛑 Stopped.")
+```
+
+if **name** == “**main**”:
+main()
