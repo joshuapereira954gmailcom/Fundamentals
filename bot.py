@@ -105,8 +105,29 @@ Setup Stats: {json.dumps(mem['setup_stats'])}
 Session Stats: {json.dumps(mem['session_stats'])}
 Pair Stats: {json.dumps(mem['pair_stats'])}
 INSTRUCTION: Adjust confidence UP for historically strong setups/sessions.
-Adjust confidence DOWN for historically weak ones. Learn from the data.
+Adjust confidence DOWN for historically weak ones.
 """.strip()
+
+# ══════════════════════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════════════════════
+
+def tg(msg: str) -> bool:
+    return tg_to(TELEGRAM_CHAT_ID, msg)
+
+def tg_to(chat_id: str, msg: str) -> bool:
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": msg,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10)
+        if r.status_code != 200:
+            log.error(f"TG send failed {r.status_code}: {r.text}")
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"TG error: {e}")
+        return False
 
 # ══════════════════════════════════════════════════════════════
 # PRICE LEVELS
@@ -408,19 +429,19 @@ UPCOMING EVENTS:
 SELF-LEARNING DATA:
 {lc}
 
-Respond ONLY in this exact JSON format. No other text:
+Respond ONLY in this exact JSON format with no markdown, no backticks, no extra text:
 {{
-  "bias": "BUY" or "SELL" or "NO TRADE",
-  "setup": "PDH Sweep+BOS" or "PDL Sweep+BOS" or "EQ Retest" or "PWH Break" or "PWL Break" or "FVG Entry" or "Momentum" or "NO TRADE",
+  "bias": "BUY or SELL or NO TRADE",
+  "setup": "PDH Sweep+BOS or PDL Sweep+BOS or EQ Retest or PWH Break or PWL Break or FVG Entry or Momentum or NO TRADE",
   "entry_zone": "price or zone",
   "stop_loss": "price",
   "tp1": "price",
   "tp2": "price",
   "rr": "e.g. 1:2.5",
-  "confidence": 0-100,
+  "confidence": 0,
   "key_level": "most important level right now",
-  "news_alignment": "ALIGNED" or "CONFLICTED" or "NEUTRAL",
-  "session_quality": "HIGH" or "MEDIUM" or "LOW",
+  "news_alignment": "ALIGNED or CONFLICTED or NEUTRAL",
+  "session_quality": "HIGH or MEDIUM or LOW",
   "avoid_reason": "if NO TRADE explain why",
   "reasoning": "2-3 sentences max",
   "smart_money_note": "one key SMC observation",
@@ -428,6 +449,7 @@ Respond ONLY in this exact JSON format. No other text:
 }}
 
 Rules:
+- Return ONLY the JSON object. No backticks. No markdown. No explanation.
 - News conflicts with technicals = reduce confidence 20% or NO TRADE
 - High impact event in <30 min = NO TRADE
 - No clear setup = NO TRADE
@@ -436,12 +458,22 @@ Rules:
     resp = ask_claude(prompt)
     try:
         clean = resp.strip()
-        if "`" in clean: clean = clean.split("`")[1]
-        if clean.startswith("json"): clean = clean[4:]
+        # Remove any markdown fences
+        if "```" in clean:
+            parts = clean.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("{"):
+                    clean = part
+                    break
+        clean = clean.strip()
         return json.loads(clean)
     except Exception as e:
-        log.error(f"Parse error: {e} | {resp[:100]}")
-        return {"bias":"NO TRADE","avoid_reason":"AI parse error","confidence":0}
+        log.error(f"Parse error: {e} | {resp[:200]}")
+        return {"bias":"NO TRADE","avoid_reason":"AI parse error","confidence":0,
+                "reasoning":"","smart_money_note":"","risk_warning":"","key_level":""}
 
 # ══════════════════════════════════════════════════════════════
 # FORMATTERS
@@ -530,24 +562,6 @@ def fmt_stats(mem) -> str:
 ⚠️ Worst: {mem.get('worst_setup','Building…')}
 ━━━━━━━━━━━━━━━━━━━━━━
 <i>Bot learns from every /win and /loss command</i>"""
-
-# ══════════════════════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════════════════════
-
-def tg(msg: str) -> bool:
-    return tg_to(TELEGRAM_CHAT_ID, msg)
-
-def tg_to(chat_id: str, msg: str) -> bool:
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": msg,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=10)
-        return r.status_code == 200
-    except Exception as e:
-        log.error(f"TG error: {e}"); return False
 
 # ══════════════════════════════════════════════════════════════
 # SCHEDULED TASKS
@@ -644,6 +658,9 @@ def task_commands():
     try:
         r   = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
                            params={"offset": last_update_id + 1}, timeout=10)
+        if r.status_code != 200:
+            log.error(f"getUpdates failed {r.status_code}: {r.text}")
+            return
         mem = load_memory()
         changed = False
 
@@ -663,7 +680,7 @@ def task_commands():
                     pending_images[chat_id].append({"file_id": file_id, "ts": time.time()})
                 continue
 
-            # Document handler (image sent as file)
+            # Document handler
             if "document" in msg_obj:
                 doc = msg_obj["document"]
                 if doc.get("mime_type","").startswith("image/"):
@@ -728,6 +745,9 @@ def task_commands():
 
 def main():
     log.info("🚀 SMC AI Bot v3.1 starting…")
+    log.info(f"TELEGRAM_TOKEN set: {bool(TELEGRAM_TOKEN)}")
+    log.info(f"TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
+    log.info(f"ANTHROPIC_API_KEY set: {bool(ANTHROPIC_API_KEY)}")
     mem = load_memory()
     tg(f"""🚀 <b>SMC AI TRADING BOT v3.1 — ONLINE</b>
 ━━━━━━━━━━━━━━━━━━━━━━
